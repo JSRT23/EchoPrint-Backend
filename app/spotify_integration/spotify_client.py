@@ -1,16 +1,18 @@
 ﻿import base64
-import json
 import logging
-import ssl
-import urllib.request
 import urllib.parse
-import urllib.error
 import requests
 from datetime import timedelta
 from django.conf import settings
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+
+class SpotifyInsufficientScopeError(Exception):
+    """Raised when Spotify returns 403 due to missing OAuth scopes."""
+    pass
+
 
 SPOTIFY_AUTH_URL = 'https://accounts.spotify.com/authorize'
 SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token'
@@ -20,14 +22,14 @@ SPOTIFY_SCOPES = [
     'user-read-private',
     'user-read-email',
     'user-read-recently-played',
+    'user-library-modify',
+    'user-library-read',
     'playlist-modify-public',
     'playlist-modify-private',
     'playlist-read-private',
+    'playlist-read-collaborative',
     'streaming',
 ]
-
-# SSL context explícito para Python 3.14
-_SSL_CTX = ssl.create_default_context()
 
 
 def _client_id() -> str:
@@ -45,7 +47,8 @@ def _client_secret() -> str:
 
 
 def _redirect_uri() -> str:
-    return getattr(settings, 'SPOTIFY_REDIRECT_URI', 'http://127.0.0.1:8000/api/spotify/callback/')
+    return getattr(settings, 'SPOTIFY_REDIRECT_URI',
+                   'http://127.0.0.1:8000/api/spotify/callback/')
 
 
 def get_auth_url(state: str = '') -> str:
@@ -57,7 +60,7 @@ def get_auth_url(state: str = '') -> str:
         'state':         state,
         'show_dialog':   'true',
     }
-    query = '&'.join([f"{k}={v}" for k, v in params.items()])
+    query = urllib.parse.urlencode(params)
     return f"{SPOTIFY_AUTH_URL}?{query}"
 
 
@@ -65,46 +68,20 @@ def _get_client_credentials_token() -> str:
     credentials = base64.b64encode(
         f"{_client_id()}:{_client_secret()}".encode()
     ).decode()
-    body = urllib.parse.urlencode(
-        {'grant_type': 'client_credentials'}).encode('utf-8')
-    req = urllib.request.Request(
+    response = requests.post(
         SPOTIFY_TOKEN_URL,
-        data=body,
+        data={'grant_type': 'client_credentials'},
         headers={
             'Authorization': f'Basic {credentials}',
             'Content-Type':  'application/x-www-form-urlencoded',
         },
-        method='POST',
+        timeout=10,
     )
-    try:
-        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=10) as resp:
-            return json.loads(resp.read().decode('utf-8'))['access_token']
-    except urllib.error.HTTPError as e:
-        body_err = e.read().decode('utf-8')
-        logger.error("Spotify token error %s — %s", e.code, body_err)
-        raise RuntimeError(
-            f"Error obteniendo token: {e.code} {body_err}") from e
-
-
-def _http_get(url: str, token: str) -> dict:
-    """GET autenticado usando urllib con SSL explícito."""
-    # Log de diagnóstico — ver en terminal de Django
-    logger.warning("SPOTIFY_GET url=%s token_prefix=%s", url, token[:15])
-    req = urllib.request.Request(
-        url,
-        method='GET',
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Accept':        'application/json',
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=10) as resp:
-            return json.loads(resp.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8')
-        logger.error("Spotify GET error %s %s — %s", e.code, url, body)
-        raise RuntimeError(f"{e.code} {e.reason}: {body}") from e
+    if not response.ok:
+        logger.error("Spotify CC token error %s: %s",
+                     response.status_code, response.text)
+        response.raise_for_status()
+    return response.json()['access_token']
 
 
 def exchange_code_for_tokens(code: str) -> dict:
@@ -133,65 +110,122 @@ def refresh_access_token(refresh_token: str) -> dict:
 def get_valid_token(user) -> str:
     if not user.spotify_access_token:
         raise ValueError('Usuario no conectado a Spotify.')
-    if user.spotify_token_expires and \
-       timezone.now() >= user.spotify_token_expires - timedelta(seconds=60):
-        data = refresh_access_token(user.spotify_refresh_token)
-        user.spotify_access_token = data['access_token']
-        user.spotify_token_expires = timezone.now(
-        ) + timedelta(seconds=data['expires_in'])
-        if 'refresh_token' in data:
-            user.spotify_refresh_token = data['refresh_token']
-        user.save(update_fields=[
-            'spotify_access_token',
-            'spotify_refresh_token',
-            'spotify_token_expires',
-        ])
+
+    needs_refresh = (
+        user.spotify_token_expires is None or
+        timezone.now() >= user.spotify_token_expires - timedelta(seconds=60)
+    )
+
+    if needs_refresh and user.spotify_refresh_token:
+        try:
+            data = refresh_access_token(user.spotify_refresh_token)
+            user.spotify_access_token = data['access_token']
+            user.spotify_token_expires = (
+                timezone.now() + timedelta(seconds=data.get('expires_in', 3600))
+            )
+            if 'refresh_token' in data:
+                user.spotify_refresh_token = data['refresh_token']
+            user.save(update_fields=[
+                'spotify_access_token',
+                'spotify_refresh_token',
+                'spotify_token_expires',
+            ])
+            logger.info("Token de Spotify refrescado para user_id=%s", user.id)
+        except Exception as exc:
+            logger.warning(
+                "No se pudo refrescar token de Spotify para user_id=%s: %s", user.id, exc)
+
     return user.spotify_access_token
 
 
 def spotify_get(user, endpoint: str) -> dict:
-    return _http_get(f"{SPOTIFY_API_BASE}{endpoint}", get_valid_token(user))
+    token = get_valid_token(user)
+    response = requests.get(
+        f"{SPOTIFY_API_BASE}{endpoint}",
+        headers={'Authorization': f'Bearer {token}'},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def spotify_post(user, endpoint: str, payload: dict) -> dict:
     token = get_valid_token(user)
-    body = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(
+    response = requests.post(
         f"{SPOTIFY_API_BASE}{endpoint}",
-        data=body,
-        method='POST',
         headers={
             'Authorization': f'Bearer {token}',
             'Content-Type':  'application/json',
-            'Accept':        'application/json',
         },
+        json=payload,
+        timeout=10,
     )
-    try:
-        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=10) as resp:
-            content = resp.read()
-            return json.loads(content.decode('utf-8')) if content else {}
-    except urllib.error.HTTPError as e:
-        body_err = e.read().decode('utf-8')
-        raise RuntimeError(f"{e.code}: {body_err}") from e
+    if not response.ok:
+        logger.error("Spotify POST error %s %s: %s",
+                     response.status_code, endpoint, response.text[:300])
+        if response.status_code == 403:
+            raise SpotifyInsufficientScopeError(
+                f"Spotify 403 en {endpoint}: permisos insuficientes. "
+                "El token no tiene los scopes necesarios. "
+                "El usuario debe desconectar y reconectar su cuenta."
+            )
+        response.raise_for_status()
+    return response.json() if response.content else {}
+
+
+def spotify_put(user, endpoint: str, payload: dict) -> bool:
+    """PUT request to Spotify API. Returns True on success."""
+    token = get_valid_token(user)
+    response = requests.put(
+        f"{SPOTIFY_API_BASE}{endpoint}",
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type':  'application/json',
+        },
+        json=payload,
+        timeout=10,
+    )
+    if not response.ok:
+        logger.error("Spotify PUT error %s %s: %s",
+                     response.status_code, endpoint, response.text[:300])
+        if response.status_code == 403:
+            raise SpotifyInsufficientScopeError(
+                f"Spotify 403 en {endpoint}: permisos insuficientes."
+            )
+        response.raise_for_status()
+    return True
 
 
 def search_track(query: str, limit: int = 20) -> list:
     token = _get_client_credentials_token()
-    # Sin limit explícito — Spotify usa 20 por defecto
-    params = urllib.parse.urlencode({'q': query, 'type': 'track'})
-    url = f"{SPOTIFY_API_BASE}/search?{params}"
-    data = _http_get(url, token)
-    items = data.get('tracks', {}).get('items', [])
+    response = requests.get(
+        f"{SPOTIFY_API_BASE}/search",
+        headers={'Authorization': f'Bearer {token}'},
+        params={'q': query, 'type': 'track'},
+        timeout=10,
+    )
+    if not response.ok:
+        logger.error("Spotify search error %s: %s",
+                     response.status_code, response.text[:300])
+        response.raise_for_status()
+    items = response.json().get('tracks', {}).get('items', [])
     return [_format_track(t) for t in items if t]
 
 
 def search_track_with_genres(query: str, limit: int = 20) -> list:
     token = _get_client_credentials_token()
-    # Sin limit explícito — Spotify usa 20 por defecto para evitar "Invalid limit"
-    params = urllib.parse.urlencode({'q': query, 'type': 'track'})
-    url = f"{SPOTIFY_API_BASE}/search?{params}"
-    data = _http_get(url, token)
-    items = data.get('tracks', {}).get('items', [])
+    response = requests.get(
+        f"{SPOTIFY_API_BASE}/search",
+        headers={'Authorization': f'Bearer {token}'},
+        params={'q': query, 'type': 'track'},
+        timeout=10,
+    )
+    if not response.ok:
+        logger.error("Spotify search_genres error %s: %s",
+                     response.status_code, response.text[:300])
+        response.raise_for_status()
+
+    items = response.json().get('tracks', {}).get('items', [])
     if not items:
         return []
 
@@ -203,13 +237,17 @@ def search_track_with_genres(query: str, limit: int = 20) -> list:
 
     genre_map: dict = {}
     try:
-        ids_params = urllib.parse.urlencode({'ids': ','.join(artist_ids)})
-        artists_data = _http_get(
-            f"{SPOTIFY_API_BASE}/artists?{ids_params}", token)
-        for a in artists_data.get('artists', []):
-            if a:
-                genres = a.get('genres', [])
-                genre_map[a['id']] = genres[0] if genres else ''
+        artists_resp = requests.get(
+            f"{SPOTIFY_API_BASE}/artists",
+            headers={'Authorization': f'Bearer {token}'},
+            params={'ids': ','.join(artist_ids)},
+            timeout=8,
+        )
+        if artists_resp.ok:
+            for a in artists_resp.json().get('artists', []):
+                if a:
+                    genres = a.get('genres', [])
+                    genre_map[a['id']] = genres[0] if genres else ''
     except Exception:
         pass
 

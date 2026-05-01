@@ -10,8 +10,9 @@ from rest_framework import permissions
 
 from .spotify_client import (
     get_auth_url, exchange_code_for_tokens,
-    spotify_get, spotify_post,
+    spotify_get, spotify_post, spotify_put,
     search_track_with_genres, _format_track,
+    SpotifyInsufficientScopeError,
 )
 from .models import SpotifyPlaylist
 from .serializers import SpotifyPlaylistSerializer, SpotifyTrackSerializer
@@ -125,19 +126,44 @@ class SpotifyPlaylistsView(APIView):
 
     def get(self, request):
         if not request.user.spotify_access_token:
-            return Response({'error': 'No conectado a Spotify.'}, status=403)
+            return Response({'error': 'No conectado a Spotify.', 'code': 'not_connected'}, status=403)
         try:
-            data = spotify_get(request.user, '/me/playlists?limit=20')
-            playlists = [{
-                'id':           p['id'],
-                'name':         p['name'],
-                'tracks_total': p['tracks']['total'],
-                'image':        p['images'][0]['url'] if p.get('images') else None,
-                'external_url': p['external_urls'].get('spotify'),
-            } for p in data.get('items', [])]
+            profile = spotify_get(request.user, '/me')
+            spotify_user_id = profile.get('id', '')
+
+            data = spotify_get(request.user, '/me/playlists?limit=50')
+            playlists = []
+            for p in data.get('items', []):
+                if not p or not p.get('id'):
+                    continue
+                owner_id = p.get('owner', {}).get('id', '')
+                collaborative = p.get('collaborative', False)
+                if owner_id != spotify_user_id and not collaborative:
+                    continue
+                playlists.append({
+                    'id':           p['id'],
+                    'name':         p['name'],
+                    'tracks_total': p.get('tracks', {}).get('total', 0),
+                    'image':        p['images'][0]['url'] if p.get('images') else None,
+                    'external_url': p.get('external_urls', {}).get('spotify'),
+                })
             return Response({'playlists': playlists})
         except Exception as e:
-            return Response({'error': str(e)}, status=500)
+            err_str = str(e)
+            logger.exception(
+                "SpotifyPlaylistsView error para user_id=%s", request.user.id)
+            # Token expirado o inválido → limpiar y pedir reconexión
+            if '401' in err_str or 'Unauthorized' in err_str.lower():
+                request.user.spotify_access_token = None
+                request.user.spotify_refresh_token = None
+                request.user.spotify_token_expires = None
+                request.user.save(update_fields=[
+                    'spotify_access_token',
+                    'spotify_refresh_token',
+                    'spotify_token_expires',
+                ])
+                return Response({'error': 'Token expirado. Reconecta tu cuenta de Spotify.', 'code': 'not_connected'}, status=403)
+            return Response({'error': err_str}, status=500)
 
 
 class SaveToSpotifyView(APIView):
@@ -155,11 +181,14 @@ class SaveToSpotifyView(APIView):
                 'code':  'not_connected'
             }, status=403)
 
+        track_uri = f"spotify:track:{spotify_track_id}"
+
+        # Intentar guardar en playlist
         try:
             if not playlist_id:
                 playlist_id = self._get_or_create_echoprint_playlist(
                     request.user)
-            track_uri = f"spotify:track:{spotify_track_id}"
+
             spotify_post(
                 request.user,
                 f'/playlists/{playlist_id}/tracks',
@@ -167,24 +196,68 @@ class SaveToSpotifyView(APIView):
             )
             return Response({
                 'message':     'Canción guardada en Spotify.',
-                'playlist_id': playlist_id
+                'playlist_id': playlist_id,
+                'saved_as':    'playlist',
             })
+
+        except SpotifyInsufficientScopeError:
+            # La app está en modo Development — Spotify bloquea escritura en playlists.
+            # Fallback: guardar en "Liked Songs" (PUT /me/tracks) que sí funciona en dev.
+            logger.warning(
+                "Playlist bloqueada (403 dev mode) para user_id=%s — fallback a Liked Songs",
+                request.user.id
+            )
+            try:
+                spotify_put(
+                    request.user,
+                    '/me/tracks',
+                    {'ids': [spotify_track_id]}
+                )
+                return Response({
+                    'message':  'Canción guardada en tus "Me gusta" de Spotify '
+                                '(la app está en modo desarrollo; para guardar en playlists '
+                                'activa el Extended Quota Mode en el Spotify Dashboard).',
+                    'saved_as': 'liked_songs',
+                })
+            except SpotifyInsufficientScopeError:
+                return Response({
+                    'error': 'Tu sesión de Spotify no tiene permisos. '
+                             'Desconecta y vuelve a conectar tu cuenta.',
+                    'code': 'insufficient_scope'
+                }, status=403)
+            except Exception as e2:
+                logger.exception("Error en fallback Liked Songs")
+                return Response({'error': str(e2)}, status=500)
+
         except Exception as e:
+            err_str = str(e)
             logger.exception("Error guardando en Spotify")
-            return Response({'error': str(e)}, status=500)
+            if '401' in err_str:
+                return Response({
+                    'error': 'Token de Spotify expirado. Reconecta tu cuenta.',
+                    'code': 'not_connected'
+                }, status=403)
+            return Response({'error': err_str}, status=500)
 
     def _get_or_create_echoprint_playlist(self, user) -> str:
         existing = SpotifyPlaylist.objects.filter(
             user=user, is_echoprint_playlist=True
         ).first()
         if existing:
-            return existing.spotify_playlist_id
+            # Verify the playlist still exists on Spotify side
+            try:
+                spotify_get(
+                    user, f'/playlists/{existing.spotify_playlist_id}?fields=id')
+                return existing.spotify_playlist_id
+            except Exception:
+                # Playlist was deleted on Spotify, recreate it
+                existing.delete()
 
-        profile = spotify_get(user, '/me')
-        spotify_user_id = profile['id']
+        # Use /me/playlists instead of /users/{id}/playlists to avoid 403
+        # on Spotify developer accounts that haven't requested extended quota
         data = spotify_post(
             user,
-            f'/users/{spotify_user_id}/playlists',
+            '/me/playlists',
             {
                 'name':        'Echoprint - Mis Canciones',
                 'description': 'Canciones identificadas con Echoprint Music',
@@ -218,6 +291,141 @@ class SpotifySearchView(APIView):
         except Exception as e:
             logger.exception("SpotifySearch error")
             return Response({'error': f'Error al buscar en Spotify: {str(e)}'}, status=500)
+
+
+class LikeTrackView(APIView):
+    """Añade una canción a los 'Me gusta' del usuario en Spotify."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        spotify_track_id = request.data.get('spotify_track_id')
+        if not spotify_track_id:
+            return Response({'error': 'spotify_track_id es requerido.'}, status=400)
+        if not request.user.spotify_access_token:
+            return Response({'error': 'No conectado a Spotify.', 'code': 'not_connected'}, status=403)
+        try:
+            spotify_put(request.user, '/me/tracks',
+                        {'ids': [spotify_track_id]})
+            return Response({'message': 'Canción añadida a Me gusta.'})
+        except SpotifyInsufficientScopeError:
+            return Response({'error': 'Permisos insuficientes. Reconecta tu cuenta.', 'code': 'insufficient_scope'}, status=403)
+        except Exception as e:
+            err_str = str(e)
+            logger.exception("Error en LikeTrackView")
+            if '401' in err_str:
+                return Response({'error': 'Token expirado. Reconecta tu cuenta.', 'code': 'not_connected'}, status=403)
+            return Response({'error': err_str}, status=500)
+
+
+class SpotifyDebugView(APIView):
+    """
+    Endpoint de diagnóstico — solo para desarrollo.
+    GET /api/spotify/debug/         → info del token
+    GET /api/spotify/debug/?test_playlist=<playlist_id> → prueba POST real a esa playlist
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        if not request.user.spotify_access_token:
+            return Response({'error': 'No conectado a Spotify.'}, status=404)
+        try:
+            from .spotify_client import get_valid_token
+            import requests as req
+            token = get_valid_token(request.user)
+
+            # Info básica del usuario
+            me_resp = req.get(
+                'https://api.spotify.com/v1/me',
+                headers={'Authorization': f'Bearer {token}'},
+                timeout=10,
+            )
+            me = me_resp.json()
+            all_headers = dict(me_resp.headers)
+
+            tests = {}
+
+            # Test 1: leer playlists propias
+            pl_resp = req.get(
+                'https://api.spotify.com/v1/me/playlists?limit=3',
+                headers={'Authorization': f'Bearer {token}'},
+                timeout=10,
+            )
+            tests['read_playlists_status'] = pl_resp.status_code
+            playlists_sample = []
+            if pl_resp.ok:
+                for p in pl_resp.json().get('items', [])[:3]:
+                    if p:
+                        playlists_sample.append({
+                            'id': p['id'],
+                            'name': p['name'],
+                            'owner': p.get('owner', {}).get('id'),
+                        })
+            tests['playlists_sample'] = playlists_sample
+
+            # Test 2: crear playlist de prueba en /me/playlists
+            create_resp = req.post(
+                'https://api.spotify.com/v1/me/playlists',
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json',
+                },
+                json={'name': '__echoprint_test__', 'public': False},
+                timeout=10,
+            )
+            tests['create_playlist_status'] = create_resp.status_code
+            tests['create_playlist_body'] = create_resp.json()
+
+            # Test 3: si se creó, intentar añadir un track (Bad Bunny - Dakiti)
+            if create_resp.ok:
+                new_pl_id = create_resp.json().get('id')
+                add_resp = req.post(
+                    f'https://api.spotify.com/v1/playlists/{new_pl_id}/tracks',
+                    headers={
+                        'Authorization': f'Bearer {token}',
+                        'Content-Type': 'application/json',
+                    },
+                    json={'uris': ['spotify:track:1yoMvmasuxZfqHEGZtrMb0']},
+                    timeout=10,
+                )
+                tests['add_track_to_new_playlist_status'] = add_resp.status_code
+                tests['add_track_to_new_playlist_body'] = add_resp.json()
+
+                # Limpiar: borrar la playlist de prueba (unfollow = delete)
+                req.delete(
+                    f'https://api.spotify.com/v1/playlists/{new_pl_id}/followers',
+                    headers={'Authorization': f'Bearer {token}'},
+                    timeout=10,
+                )
+
+            # Test 4: si viene playlist_id en query, probar añadir track ahí
+            test_pl = request.query_params.get('test_playlist')
+            if test_pl:
+                add2_resp = req.post(
+                    f'https://api.spotify.com/v1/playlists/{test_pl}/tracks',
+                    headers={
+                        'Authorization': f'Bearer {token}',
+                        'Content-Type': 'application/json',
+                    },
+                    json={'uris': ['spotify:track:1yoMvmasuxZfqHEGZtrMb0']},
+                    timeout=10,
+                )
+                tests['add_track_to_existing_status'] = add2_resp.status_code
+                tests['add_track_to_existing_body'] = add2_resp.json()
+
+            return Response({
+                'spotify_user_id': me.get('id'),
+                'product': me.get('product'),
+                'token_preview': token[:20] + '...',
+                'token_expires': str(request.user.spotify_token_expires),
+                'spotify_response_headers': {
+                    k: v for k, v in all_headers.items()
+                    if k.lower().startswith('x-') or k.lower() == 'content-type'
+                },
+                'tests': tests,
+            })
+        except Exception as e:
+            logger.exception("SpotifyDebugView error")
+            return Response({'error': str(e)}, status=500)
 
 
 class SpotifyRecentlyPlayedView(APIView):

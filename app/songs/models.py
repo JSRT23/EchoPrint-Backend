@@ -54,8 +54,9 @@ class Fingerprint(models.Model):
 
 class UserHistory(models.Model):
     METHOD_CHOICES = [
-        ('audio', 'Audio'),
-        ('text', 'Texto'),
+        ('audio',   'Audio'),
+        ('text',    'Texto'),
+        ('humming', 'Tarareo'),
     ]
     user = models.ForeignKey(
         CustomUser, on_delete=models.CASCADE, related_name='history')

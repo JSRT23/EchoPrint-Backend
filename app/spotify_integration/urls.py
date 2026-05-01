@@ -1,4 +1,3 @@
-
 from django.urls import path
 from .views import (
     SpotifyAuthURLView,
@@ -7,8 +6,10 @@ from .views import (
     SpotifyDisconnectView,
     SpotifyPlaylistsView,
     SaveToSpotifyView,
+    LikeTrackView,
     SpotifySearchView,
     SpotifyRecentlyPlayedView,
+    SpotifyDebugView,
 )
 
 urlpatterns = [
@@ -22,8 +23,12 @@ urlpatterns = [
     path('playlists/',        SpotifyPlaylistsView.as_view(),
          name='spotify-playlists'),
     path('save/',             SaveToSpotifyView.as_view(),       name='spotify-save'),
+    path('like/',             LikeTrackView.as_view(),
+         name='spotify-like'),
     path('search/',           SpotifySearchView.as_view(),
          name='spotify-search'),
     path('recently-played/',  SpotifyRecentlyPlayedView.as_view(),
          name='spotify-recently-played'),
+    path('debug/',            SpotifyDebugView.as_view(),
+         name='spotify-debug'),
 ]
