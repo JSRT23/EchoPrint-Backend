@@ -9,33 +9,33 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# ─── Cargar .env ANTES de leer cualquier variable ─────────────────────────────
+# ─── ENV ─────────────────────────────────────
 load_dotenv(BASE_DIR / '.env')
 
-# ─── Seguridad ────────────────────────────────────────────────────────────────
-SECRET_KEY = os.getenv(
-    'SECRET_KEY',
-    'django-insecure-o#l_+zb3v82d2g=t6n=izz=dncnla1(i7_@yl(_g&edu+8!a@x'
-)
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '127.0.0.1,localhost').split(',')
+# ─── Seguridad ───────────────────────────────
+SECRET_KEY = os.getenv('SECRET_KEY', 'unsafe-secret-key')
 
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
-# ─── Spotify ──────────────────────────────────────────────────────────────────
-# Leídas aquí para que estén en settings y spotify_client.py las use con
-# getattr(settings, 'SPOTIFY_CLIENT_ID') en tiempo de ejecución, no de importación.
-SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID', '')
-SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET', '')
-SPOTIFY_REDIRECT_URI = os.getenv(
-    'SPOTIFY_REDIRECT_URI',
-    'http://localhost:8000/api/spotify/callback/'
+ALLOWED_HOSTS = os.getenv(
+    'ALLOWED_HOSTS',
+    '127.0.0.1,localhost,.onrender.com'
+).split(',')
+
+FRONTEND_URL = os.getenv(
+    'FRONTEND_URL',
+    'http://localhost:5173'
 )
 
-# ─── AcoustID ─────────────────────────────────────────────────────────────────
-ACOUSTID_API_KEY = os.getenv('ACOUSTID_API_KEY', '')
+# ─── Spotify ─────────────────────────────────
+SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
+SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
+SPOTIFY_REDIRECT_URI = os.getenv('SPOTIFY_REDIRECT_URI')
 
-# ─── Apps ─────────────────────────────────────────────────────────────────────
+# ─── AcoustID ────────────────────────────────
+ACOUSTID_API_KEY = os.getenv('ACOUSTID_API_KEY')
+
+# ─── Apps ────────────────────────────────────
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -43,21 +43,23 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    # Third party
+
     'rest_framework',
-    'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
-    # Apps propias
+
     'app.users',
     'app.songs',
     'app.recognition',
     'app.spotify_integration',
 ]
 
+# ─── Middleware ──────────────────────────────
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
+
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -67,11 +69,12 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'config.urls'
+WSGI_APPLICATION = 'config.wsgi.application'
 
+# ─── Templates ───────────────────────────────
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -83,52 +86,64 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'config.wsgi.application'
+# ─── Base de datos (Render PostgreSQL ready) ─
+if os.getenv('DATABASE_URL'):
+    import dj_database_url
 
-# ─── Base de datos ────────────────────────────────────────────────────────────
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    DATABASES = {
+        'default': dj_database_url.config(
+            conn_max_age=600,
+            ssl_require=True
+        )
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
-# ─── DRF + JWT ────────────────────────────────────────────────────────────────
+# ─── DRF + JWT ───────────────────────────────
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticatedOrReadOnly',
-    ),
 }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME':  timedelta(hours=1),
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 }
 
-# ─── CORS ─────────────────────────────────────────────────────────────────────
-CORS_ALLOW_ALL_ORIGINS = True   # Solo para desarrollo local
-
-# ─── Auth ─────────────────────────────────────────────────────────────────────
-AUTH_USER_MODEL = 'users.CustomUser'
-
-AUTH_PASSWORD_VALIDATORS = [
-    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
+# ─── CORS / CSRF ─────────────────────────────
+CORS_ALLOWED_ORIGINS = [
+    FRONTEND_URL,
 ]
 
-# ─── i18n ─────────────────────────────────────────────────────────────────────
+CORS_ALLOW_CREDENTIALS = True
+
+CSRF_TRUSTED_ORIGINS = [
+    FRONTEND_URL,
+]
+
+# ─── Auth ────────────────────────────────────
+AUTH_USER_MODEL = 'users.CustomUser'
+
+# ─── i18n ───────────────────────────────────
 LANGUAGE_CODE = 'es-co'
 TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-# ─── Static / Media ───────────────────────────────────────────────────────────
-STATIC_URL = 'static/'
+# ─── Static ──────────────────────────────────
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_DIRS = []
+
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+# ─── Media ───────────────────────────────────
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
