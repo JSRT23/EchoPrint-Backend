@@ -26,8 +26,15 @@ class RecognizeAudioView(APIView):
 
         try:
             audio_bytes = audio_file.read()
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error("RECOGNIZE: tamaño=%d bytes, content_type=%s", len(
+                audio_bytes), audio_file.content_type)
             result = recognize_audio(audio_bytes)
         except RuntimeError as e:
+            import logging
+            logging.getLogger(__name__).error(
+                "RECOGNIZE RuntimeError: %s", str(e), exc_info=True)
             return Response({'error': str(e)}, status=422)
 
         if not result['found']:

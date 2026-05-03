@@ -58,10 +58,11 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
+    # FIX: CorsMiddleware debe ir ANTES de cualquier otro middleware
     'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.common.CommonMiddleware',
 
     'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -117,15 +118,49 @@ SIMPLE_JWT = {
 }
 
 # ─── CORS / CSRF ─────────────────────────────
-CORS_ALLOWED_ORIGINS = [
-    FRONTEND_URL,
-]
+# FIX: Soporte para múltiples dominios de frontend separados por coma
+_raw_origins = os.getenv('CORS_ALLOWED_ORIGINS', FRONTEND_URL)
+_origins_list = [o.strip() for o in _raw_origins.split(',') if o.strip()]
+
+# En desarrollo siempre permitir ambos orígenes locales
+if DEBUG or not os.getenv('CORS_ALLOWED_ORIGINS'):
+    for _local in ['http://localhost:5173', 'http://127.0.0.1:5173',
+                   'http://localhost:3000', 'http://127.0.0.1:3000']:
+        if _local not in _origins_list:
+            _origins_list.append(_local)
+
+CORS_ALLOWED_ORIGINS = _origins_list
+
+# FIX: Agrega soporte para patrones de Vercel (previews de PR)
+_raw_regex = os.getenv('CORS_ALLOWED_ORIGIN_REGEXES', '')
+CORS_ALLOWED_ORIGIN_REGEXES = [r.strip()
+                               for r in _raw_regex.split(',') if r.strip()]
 
 CORS_ALLOW_CREDENTIALS = True
 
-CSRF_TRUSTED_ORIGINS = [
-    FRONTEND_URL,
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
 ]
+
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
+CSRF_TRUSTED_ORIGINS = [o.strip()
+                        for o in _raw_origins.split(',') if o.strip()]
 
 # ─── Auth ────────────────────────────────────
 AUTH_USER_MODEL = 'users.CustomUser'
@@ -148,3 +183,25 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ── Logging para debug ────────────────────────────────────────────────────────
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'ERROR',
+    },
+    'loggers': {
+        'app': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+    },
+}

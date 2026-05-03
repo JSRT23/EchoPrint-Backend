@@ -2,7 +2,7 @@ from django.urls import path
 from .views import (
     SongListView, SongDetailView, SongSearchView,
     UserHistoryView, UserHistoryAddView, UserHistoryDeleteView,
-    UserStatsView
+    UserStatsView, ItunesProxyView
 )
 
 urlpatterns = [
@@ -15,4 +15,5 @@ urlpatterns = [
     path('history/<int:pk>/delete/', UserHistoryDeleteView.as_view(),
          name='user-history-delete'),
     path('stats/',    UserStatsView.as_view(),         name='user-stats'),
+    path('itunes/',   ItunesProxyView.as_view(),       name='itunes-proxy'),
 ]

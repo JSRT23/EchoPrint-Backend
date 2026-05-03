@@ -168,3 +168,33 @@ class UserStatsView(APIView):
             'top_artists':      list(top_artists),
             'by_method':        list(by_method),
         })
+
+
+class ItunesProxyView(APIView):
+    """Proxy server-side para la API de iTunes, evitando el redirect musics:// en browsers."""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        term = request.query_params.get('term', '').strip()
+        if not term:
+            return Response({'error': 'term requerido'}, status=400)
+        try:
+            import urllib.request
+            import urllib.parse
+            import json as _json
+            q = urllib.parse.urlencode({
+                'term':   term,
+                'media':  'music',
+                'entity': 'song',
+                'limit':  '10',
+            })
+            url = f'https://itunes.apple.com/search?{q}'
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; Echoprint/1.0)',
+                'Accept':     'application/json',
+            })
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = _json.loads(resp.read().decode('utf-8'))
+            return Response(data)
+        except Exception as e:
+            return Response({'error': str(e), 'results': []}, status=502)
