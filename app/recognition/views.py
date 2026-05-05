@@ -1,6 +1,6 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import permissions
+from rest_framework import permissions, throttling
 from app.songs.models import Song, Artist, Album, UserHistory
 from app.songs.serializers import SongSerializer
 from app.spotify_integration.spotify_client import enrich_song_from_spotify
@@ -8,8 +8,19 @@ from .models import RecognitionLog
 from .fingerprint_engine import recognize_audio, recognize_humming
 
 
+class RecognizeThrottle(throttling.AnonRateThrottle):
+    """
+    Limita el endpoint de reconocimiento para usuarios anónimos.
+    Evita abuso del servicio ACRCloud (de pago).
+    Tasa: 10 reconocimientos por hora por IP.
+    Configurable en settings con ANON_RECOGNIZE_RATE.
+    """
+    scope = 'recognize'
+
+
 class RecognizeAudioView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [RecognizeThrottle]
 
     def post(self, request):
         audio_file = request.FILES.get('audio')
@@ -150,6 +161,7 @@ class RecognizeHummingView(APIView):
     Usa el proyecto Humming de ACRCloud.
     """
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [RecognizeThrottle]
 
     def post(self, request):
         audio_file = request.FILES.get('audio')

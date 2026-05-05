@@ -110,6 +110,16 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    # Paginación global para UserHistoryView y similares
+    # El frontend ya maneja `data.results ?? data` correctamente
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': int(os.getenv('PAGE_SIZE', '20')),
+    # Rate limiting global — refina por endpoint con throttle_classes
+    'DEFAULT_THROTTLE_CLASSES': [],
+    'DEFAULT_THROTTLE_RATES': {
+        # 10 reconocimientos/hora para IPs anónimas (ACRCloud es de pago)
+        'recognize': os.getenv('ANON_RECOGNIZE_RATE', '10/hour'),
+    },
 }
 
 SIMPLE_JWT = {

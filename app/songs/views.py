@@ -48,11 +48,14 @@ class SongSearchView(APIView):
 class UserHistoryView(generics.ListAPIView):
     serializer_class = UserHistorySerializer
     permission_classes = [permissions.IsAuthenticated]
+    # Paginación: el frontend ya maneja `data.results ?? data`
+    # PAGE_SIZE configurable en settings (default 20)
+    pagination_class = None  # Se hereda del DEFAULT_PAGINATION_CLASS global
 
     def get_queryset(self):
         return UserHistory.objects.filter(
             user=self.request.user
-        ).select_related('song', 'song__artist', 'song__album')
+        ).select_related('song', 'song__artist', 'song__album').order_by('-recognized_at')
 
 
 class UserHistoryAddView(APIView):
