@@ -55,7 +55,7 @@ class UserHistoryView(generics.ListAPIView):
     def get_queryset(self):
         return UserHistory.objects.filter(
             user=self.request.user
-        ).select_related('song', 'song__artist', 'song__album').order_by('-recognized_at')
+        ).select_related('song', 'song__artist', 'song__album').order_by('-identified_at')
 
 
 class UserHistoryAddView(APIView):
