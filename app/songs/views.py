@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Q, Count
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from .models import Song, Artist, Album, UserHistory
 from .serializers import (
     SongSerializer, SongSearchSerializer,
@@ -45,11 +46,37 @@ class SongSearchView(APIView):
         })
 
 
+def _upsert_history(user, song, method, match_timestamp_seconds=None):
+    """
+    Flujo de historial limpio y profesional:
+    - Si la canción ya existe en el historial del usuario (cualquier método),
+      ELIMINA la entrada anterior y crea una nueva con timestamp actual.
+      → Así siempre aparece en el tope, sin duplicados.
+    - Si no existe, simplemente la crea.
+    Devuelve (entry, was_new).
+    """
+    # Buscar entrada existente (misma canción, mismo usuario, cualquier método)
+    existing = UserHistory.objects.filter(
+        user=user,
+        song=song,
+    ).order_by('-identified_at').first()
+
+    if existing:
+        # Borrar la anterior y crear nueva con timestamp fresco
+        existing.delete()
+
+    entry = UserHistory.objects.create(
+        user=user,
+        song=song,
+        method=method,
+        match_timestamp_seconds=match_timestamp_seconds,
+    )
+    return entry, True
+
+
 class UserHistoryView(generics.ListAPIView):
     serializer_class = UserHistorySerializer
     permission_classes = [permissions.IsAuthenticated]
-    # Paginación: el frontend ya maneja `data.results ?? data`
-    # PAGE_SIZE configurable en settings (default 20)
     pagination_class = None  # Se hereda del DEFAULT_PAGINATION_CLASS global
 
     def get_queryset(self):
@@ -66,7 +93,6 @@ class UserHistoryAddView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        # Datos que vienen del frontend (canción de Spotify)
         spotify_id = request.data.get('spotify_id', '')
         title = request.data.get('title', '').strip()
         artist_name = request.data.get('artist', '').strip()
@@ -105,7 +131,6 @@ class UserHistoryAddView(APIView):
                 'spotify_preview_url': preview_url or '',
             }
         )
-        # Si ya existía, actualizar cover/preview si faltaban
         if not created:
             updated = False
             if not song.cover_url and cover_url:
@@ -117,8 +142,8 @@ class UserHistoryAddView(APIView):
             if updated:
                 song.save()
 
-        # Registrar en historial
-        history_entry = UserHistory.objects.create(
+        # ── Registrar en historial SIN duplicados ─────────────────────
+        history_entry, was_created = _upsert_history(
             user=request.user,
             song=song,
             method='text',
@@ -126,10 +151,10 @@ class UserHistoryAddView(APIView):
         )
 
         return Response({
-            'message': 'Canción agregada al historial.',
+            'message': 'Canción agregada al historial.' if was_created else 'Ya estaba en el historial reciente.',
             'history_id': history_entry.id,
             'song': SongSerializer(song).data,
-        }, status=201)
+        }, status=201 if was_created else 200)
 
 
 class UserHistoryDeleteView(APIView):

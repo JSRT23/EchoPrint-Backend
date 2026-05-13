@@ -1,6 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import permissions, throttling
+from django.utils import timezone
 from app.songs.models import Song, Artist, Album, UserHistory
 from app.songs.serializers import SongSerializer
 from app.spotify_integration.spotify_client import enrich_song_from_spotify
@@ -16,6 +17,101 @@ class RecognizeThrottle(throttling.AnonRateThrottle):
     Configurable en settings con ANON_RECOGNIZE_RATE.
     """
     scope = 'recognize'
+
+
+def _upsert_history(user, song, method, match_timestamp_seconds=None):
+    """
+    Flujo de historial limpio y profesional:
+    - Si la canción ya existe en el historial del usuario,
+      ELIMINA la entrada anterior y crea una nueva con timestamp actual.
+      → Siempre aparece en el tope, sin duplicados.
+    - Si no existe, simplemente la crea.
+    Devuelve (entry, was_new).
+    """
+    existing = UserHistory.objects.filter(
+        user=user,
+        song=song,
+    ).order_by('-identified_at').first()
+
+    if existing:
+        existing.delete()
+
+    entry = UserHistory.objects.create(
+        user=user,
+        song=song,
+        method=method,
+        match_timestamp_seconds=match_timestamp_seconds,
+    )
+    return entry, True
+
+
+def _get_or_create_song_from_result(result: dict) -> Song:
+    """
+    Busca la canción en la BD por título+artista.
+    Si no existe la crea enriqueciendo con Spotify.
+    Lógica compartida entre audio y humming.
+    """
+    title = result.get('title', '')
+    artist_name = result.get('artist', '')
+
+    # Buscar si ya existe (por spotify_id primero, luego título+artista)
+    spotify_id = result.get('spotify_id', '')
+    if spotify_id:
+        existing = Song.objects.filter(
+            spotify_id=spotify_id
+        ).select_related('artist', 'album').first()
+        if existing:
+            return existing
+
+    existing = Song.objects.filter(
+        title__iexact=title,
+        artist__name__iexact=artist_name
+    ).select_related('artist', 'album').first()
+
+    if existing:
+        return existing
+
+    # Enriquecer con Spotify
+    spotify_data = enrich_song_from_spotify(title, artist_name)
+
+    # Crear o buscar artista
+    artist, _ = Artist.objects.get_or_create(
+        name__iexact=artist_name,
+        defaults={
+            'name':       artist_name,
+            'spotify_id': spotify_data.get('spotify_id', ''),
+        }
+    )
+
+    # Crear o buscar álbum
+    album = None
+    album_title = result.get('album') or spotify_data.get('album', '')
+    if album_title:
+        album, _ = Album.objects.get_or_create(
+            title__iexact=album_title,
+            artist=artist,
+            defaults={
+                'title':     album_title,
+                'cover_url': spotify_data.get('cover_url'),
+            }
+        )
+
+    # Crear canción
+    song = Song.objects.create(
+        title=title,
+        artist=artist,
+        album=album,
+        genre=result.get('genre', ''),
+        duration_seconds=result.get('duration_seconds'),
+        cover_url=(
+            result.get('cover_url') or
+            spotify_data.get('cover_url')
+        ),
+        spotify_id=spotify_data.get('spotify_id', ''),
+        spotify_preview_url=spotify_data.get('preview_url', ''),
+    )
+
+    return song
 
 
 class RecognizeAudioView(APIView):
@@ -61,17 +157,12 @@ class RecognizeAudioView(APIView):
                 'song': None,
             })
 
-        # Buscar o crear la canción en la BD
-        song = self._get_or_create_song(result)
-
-        # ── Timestamp de coincidencia ──────────────────────────────────────
-        # match_timestamp_seconds: segundo en la canción original donde
-        # se encontró la coincidencia del fragmento grabado.
+        song = _get_or_create_song_from_result(result)
         match_ts = result.get('match_timestamp_seconds')
 
-        # Guardar historial si hay usuario autenticado
+        # ── Historial SIN duplicados ───────────────────────────────────
         if request.user.is_authenticated:
-            UserHistory.objects.create(
+            _upsert_history(
                 user=request.user,
                 song=song,
                 method='audio',
@@ -89,70 +180,9 @@ class RecognizeAudioView(APIView):
             'status': 'success',
             'message': '¡Canción identificada!',
             'score': result['score'],
-            # ← NUEVO: retornamos el timestamp para que el frontend
-            #   pueda iniciar la reproducción desde ese segundo exacto
             'match_timestamp_seconds': match_ts,
             'song': SongSerializer(song).data,
         })
-
-    def _get_or_create_song(self, result: dict) -> Song:
-        """
-        Busca la canción en la BD por título+artista.
-        Si no existe la crea enriqueciendo con Spotify.
-        """
-        title = result.get('title', '')
-        artist_name = result.get('artist', '')
-
-        # Buscar si ya existe
-        existing = Song.objects.filter(
-            title__iexact=title,
-            artist__name__iexact=artist_name
-        ).select_related('artist', 'album').first()
-
-        if existing:
-            return existing
-
-        # Enriquecer con Spotify
-        spotify_data = enrich_song_from_spotify(title, artist_name)
-
-        # Crear o buscar artista
-        artist, _ = Artist.objects.get_or_create(
-            name__iexact=artist_name,
-            defaults={
-                'name':       artist_name,
-                'spotify_id': spotify_data.get('spotify_id', ''),
-            }
-        )
-
-        # Crear o buscar álbum
-        album = None
-        album_title = result.get('album') or spotify_data.get('album', '')
-        if album_title:
-            album, _ = Album.objects.get_or_create(
-                title__iexact=album_title,
-                artist=artist,
-                defaults={
-                    'title':     album_title,
-                    'cover_url': spotify_data.get('cover_url'),
-                }
-            )
-
-        # Crear canción
-        song = Song.objects.create(
-            title=title,
-            artist=artist,
-            album=album,
-            genre=result.get('genre', ''),
-            duration_seconds=result.get('duration_seconds'),
-            cover_url=(
-                result.get('cover_url') or
-                spotify_data.get('cover_url')
-            ),
-            spotify_id=spotify_data.get('spotify_id', ''),
-            spotify_preview_url=spotify_data.get('preview_url', ''),
-        )
-
-        return song
 
 
 class RecognizeHummingView(APIView):
@@ -188,13 +218,16 @@ class RecognizeHummingView(APIView):
                 'song':    None,
             })
 
-        song = self._get_or_create_song(result)
+        song = _get_or_create_song_from_result(result)
         match_ts = result.get('match_timestamp_seconds')
 
+        # ── Historial SIN duplicados ───────────────────────────────────
         if request.user.is_authenticated:
-            UserHistory.objects.create(
-                user=request.user, song=song,
-                method='humming', match_timestamp_seconds=match_ts,
+            _upsert_history(
+                user=request.user,
+                song=song,
+                method='humming',
+                match_timestamp_seconds=match_ts,
             )
 
         RecognitionLog.objects.create(
@@ -209,42 +242,3 @@ class RecognizeHummingView(APIView):
             'match_timestamp_seconds': match_ts,
             'song':    SongSerializer(song).data,
         })
-
-    def _get_or_create_song(self, result: dict):
-        # Reutiliza la misma lógica de RecognizeAudioView
-        title = result.get('title', '')
-        artist_name = result.get('artist', '')
-
-        existing = Song.objects.filter(
-            title__iexact=title,
-            artist__name__iexact=artist_name
-        ).select_related('artist', 'album').first()
-
-        if existing:
-            return existing
-
-        spotify_data = enrich_song_from_spotify(title, artist_name)
-
-        artist, _ = Artist.objects.get_or_create(
-            name__iexact=artist_name,
-            defaults={'name': artist_name,
-                      'spotify_id': spotify_data.get('spotify_id', '')}
-        )
-
-        album = None
-        album_title = result.get('album') or spotify_data.get('album', '')
-        if album_title:
-            album, _ = Album.objects.get_or_create(
-                title__iexact=album_title, artist=artist,
-                defaults={'title': album_title,
-                          'cover_url': spotify_data.get('cover_url')}
-            )
-
-        return Song.objects.create(
-            title=title, artist=artist, album=album,
-            genre=result.get('genre', ''),
-            duration_seconds=result.get('duration_seconds'),
-            cover_url=result.get('cover_url') or spotify_data.get('cover_url'),
-            spotify_id=spotify_data.get('spotify_id', ''),
-            spotify_preview_url=spotify_data.get('preview_url', ''),
-        )
