@@ -1,0 +1,20 @@
+# Desarrollo:  docker compose up --build   ->  http://localhost:8000/api/
+# El código se monta como volumen: los cambios recargan solos.
+# La base de datos es SQLite (db.sqlite3 en esta carpeta). Para PostgreSQL define DATABASE_URL en .env.
+services:
+  api:
+    build: .
+    container_name: echoprint-api
+    command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DEBUG: ${DEBUG:-True}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-127.0.0.1,localhost}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+    volumes:
+      - .:/app
+    restart: unless-stopped
